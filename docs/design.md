@@ -24,21 +24,39 @@
 - ブースキーは URL の `#` 以降（フラグメント）に置き、サーバーのログに残らないようにする。
 - フロアの人は匿名で使う。端末ごとに `clientId`（UUID）を localStorage に保存し、ニックネームは任意入力。
 
+### イベント単位
+
+- リクエストのリストはイベントごとに独立している。別のイベントのリクエストは見えない。
+- どの DJ が流したかは記録しない。ブースキーを持つ人は全員同じ権限で操作する。
+
+### QR コード
+
+- フロアの送信画面（`/e/:slug`）の URL を QR コードにする。
+- ブース画面に QR コードを表示し、PNG のダウンロードと印刷用ページ（`/e/:slug/qr`）を用意する。
+- バー表示にも常に QR コードを出す。
+- QR コードはブラウザ側で生成する（サーバー処理は不要）。
+
 ### 公開範囲
 
-バー表示と VJ に出す情報は **DJ が「流す」と判断したもの（`playing` / `played`）だけ** にする。
-未承認のリクエストは件数のみ表示する。不適切な内容がバー表示や VJ 画面にそのまま出る事故を防ぐため。
+バー表示と VJ に出すのは、**DJ が「流せる」と判断したもの（`accepted` / `playing` / `played`）だけ**。
+未判断（`pending`）と「流せない」（`rejected`）は出さない。未判断の件数だけは表示する。
 
 ## 3. リクエストの状態遷移
 
 ```
-queued ──(DJ: 流す)──▶ playing ──(DJ: 終了 / 次の曲が playing)──▶ played
-   │
-   └──(DJ: 見送り)──▶ dismissed
+                 ┌─(DJ: 流せる)─▶ accepted ─(DJ: 再生開始)─┐
+pending(未判断) ─┤                                        ├─▶ playing ─(DJ: 終了 / 次の曲を再生開始)─▶ played
+                 ├─(DJ: 再生開始)──────────────────────────┘
+                 └─(DJ: 流せない)─▶ rejected
 ```
 
-- `playing` は同時に1件だけ。新しく `playing` にした時点で、前の曲は自動で `played` になる。
-- `dismissed` はリクエストした本人にも「見送り」とは表示せず、`queued` のまま見せる（揉めないように）。※要検討
+- `pending`：届いたばかりで、DJ がまだ判断していない
+- `accepted`：DJ が「流せる」と判断した。バー表示に **「再生待ち」** として出る
+- `rejected`：DJ が「流せない」と判断した
+- `playing`：今流している。常に1件だけで、新しく `playing` にすると前の曲は自動で `played` になる
+- `played`：流し終わった
+- 判断ミスを直せるよう、`pending` / `accepted` / `rejected` の間は相互に戻せる
+- `rejected` をリクエストした本人にどう見せるかは **要検討**（「流せません」と明示するか、`pending` のまま見せるか）
 
 ## 4. データモデル
 
@@ -58,8 +76,9 @@ type SongRequest = {
   tieIn?: string;          // タイアップ作品
   nickname?: string;       // 未入力なら「名無しさん」
   clientId: string;        // 匿名の端末 ID（DJ にのみ見える）
-  status: "queued" | "playing" | "played" | "dismissed";
+  status: "pending" | "accepted" | "rejected" | "playing" | "played";
   createdAt: number;
+  decidedAt?: number;      // 流せる / 流せないを判断した時刻
   playingAt?: number;
   playedAt?: number;
 };
@@ -79,7 +98,7 @@ REST：
 | GET | `/api/events/:slug/requests` | 全件 | ブースキー |
 | PATCH | `/api/events/:slug/requests/:id` | 状態変更 | ブースキー |
 | GET | `/api/events/:slug/now-playing` | VJ 用：現在の曲 | なし |
-| GET | `/api/events/:slug/public` | バー表示用：現在の曲、履歴、待ち件数 | なし |
+| GET | `/api/events/:slug/public` | バー表示用：現在の曲、再生待ち（accepted）、履歴、未判断件数 | なし |
 
 WebSocket：`/api/events/:slug/ws?role=guest|booth|display|vj`
 - 接続直後にロールに応じた **スナップショット** を送り、以降は差分イベントを送る。
@@ -99,15 +118,16 @@ VJ 向け `now-playing` のレスポンス例：
 
 ## 7. いたずら対策（MVP）
 
-- 回数制限：同じ `clientId` から **3分に1件**、未処理（`queued`）は **3件まで**
+- 回数制限：同じ `clientId` から **3分に1件**、未処理（`pending` / `accepted`）は **3件まで**
 - DJ は `clientId` 単位でブロックできる（ブロックされた人の送信は成功したように見せて破棄する）
 - 公開範囲を絞る（§2）
 
 ## 8. 画面（MVP）
 
 - **フロア**：入力フォーム（3項目＋ニックネーム）、自分のリクエスト一覧（状態をリアルタイム表示、`playing` になったら強調表示とバイブレーション）
-- **ブース**：未処理リクエストを古い順に並べ、各カードに「流す」「見送り」ボタン。現在の曲と履歴も表示。大画面と暗い場所での使用を前提にする
-- **バー表示**：Now Playing（リクエスト者名つき）、直近の履歴、未処理件数、リクエスト用 QR コード
+- **ブース**：タブで「未判断」「再生待ち」「流せない」「履歴」を切り替える。未判断のカードには「流せる」「流せない」「今すぐ再生」、再生待ちのカードには「再生開始」ボタン。現在の曲と QR コードも表示。大画面と暗い場所での使用を前提にする
+- **バー表示**：Now Playing（リクエスト者名つき）、再生待ちリスト（`accepted` のみ）、直近の履歴、未判断の件数、リクエスト用 QR コード
+- **QR 印刷用**（`/e/:slug/qr`）：イベント名と QR コードだけを大きく出す、印刷向けのページ
 - **オーバーレイ**：Now Playing が変わったときに一定時間だけアニメーション表示
 
 ## 9. 第2段階の候補
